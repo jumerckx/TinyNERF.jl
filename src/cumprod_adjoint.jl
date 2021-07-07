@@ -1,6 +1,6 @@
 # code from https://github.com/FluxML/Zygote.jl/pull/294
 
-import Zygote
+import Flux.Zygote
 
 reversesumscan_(x::AbstractArray; dims::Integer) =
     reverse(cumsum(reverse(x, dims=dims), dims=dims), dims=dims)
