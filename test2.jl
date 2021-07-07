@@ -140,7 +140,7 @@ function render(emb_fn, network_fn, pts, directions, z_vals)
         cat(z_vals[:, :, 2:end] .- z_vals[:, :, 1:(end-1)], fill(eltype(z_vals)(1e10), size(z_vals)[[1, 2]]), dims=3)
     end
     α = 1 .- exp.(-σₐ .* δ)
-    weights = α .* cat(CUDA.ones(1, size(α, 2)), cumprod((1 .- α .+ eps(eltype(α)))[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
+    weights = α .* cat(gpu(ones(1, size(α, 2))), cumprod((1 .- α .+ eps(eltype(α)))[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
     
     rgb_map = sum(rgb .* weights, dims=3)[:, :, 1]
 end
