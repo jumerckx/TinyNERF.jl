@@ -10,11 +10,14 @@ EllipsisNotation = "da5c29d0-fa7d-589e-88eb-ea29b0a81949"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
 Images = "916415d5-f1e6-5110-898d-aaa5f9f070e0"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [compat]
 EllipsisNotation = "1"
+NPZ = "0.4"
 julia = "1"
 
 [extras]

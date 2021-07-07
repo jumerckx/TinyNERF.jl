@@ -1,17 +1,28 @@
-using TinyNERF, Images, Flux, CUDA, EllipsisNotation, Statistics, StatsBase
+using TinyNERF, Images, Flux, CUDA, EllipsisNotation, Statistics, StatsBase, JSON
 using Flux: @nograd, Zygote.ignore, params, glorot_uniform
 
-dataset = get_data()
-images = permutedims(dataset["images"], (4, 2, 3, 1)) # Images×Height×Width×Channels -> Channels×Height×Width×Images
-poses = permutedims(dataset["poses"], (2, 3, 1))
-focal = dataset["focal"]
+transforms = JSON.parsefile("local/transforms_train.json")
 
-const H, W = size(images)[[2, 3]]
+const W, H = 800, 800
 
-testimg, testpose = images[:, :, :, 102], poses[:, :, 102]
-colorview(RGB, testimg)
+const focal = W / (2*tan(transforms["camera_angle_x"]/2))
 
-images, poses = images[:, :, :, 1:101], poses[:, :, 1:101]
+poses = []
+images = []
+
+for frame in transforms["frames"]
+    push!(poses, hcat(frame["transform_matrix"]...)')
+    push!(images, float32.(channelview(load("./local/$(frame["file_path"]).png"))[1:3, :, :]))
+end
+
+poses = cat(poses..., dims=3)
+images = cat(images..., dims=4) # channels × H × W × images
+
+testpose = poses[:, :, 100]
+testimg = gpu(images[:, :, :, 100])
+
+poses = poses[:, :, 1:99]
+images = images[:, :, :, 1:99]
 
 function posenc(x, L_embed=6)
     out = similar(x, (3 + 3 * 2 * L_embed, size(x)[2:end]...))
@@ -22,20 +33,42 @@ function posenc(x, L_embed=6)
 end
 @nograd posenc
 
-function init_model(W=256; L_embed=6)
+struct MLP{T}
+    arch::T
+end
+Flux.@functor MLP
+
+function MLP(W::Integer=256, L_embed=6)
     inputsize = 3 * (1 + 2 * L_embed)
-    Chain(
+    directionsize = inputsize
+
+    arch = Chain(
         SkipConnection(
             Chain(
                 Dense(inputsize, W, relu),
                 Dense(W, W, relu),
                 Dense(W, W, relu),
+                Dense(W, W, relu), 
                 Dense(W, W, relu)),
             (mx, x) -> vcat(mx, x)),
         Dense(W + inputsize, W, relu),
         Dense(W, W, relu),
         Dense(W, W, relu),
-        Dense(W, 4, identity))
+        Dense(W, W, identity),
+        Dense(W-1+directionsize, W÷2, relu),
+        Dense(W÷2, 3, sigmoid))
+    return MLP(arch)
+end
+
+function (m::MLP)(𝐱, viewing_dir)
+    x = reshape(𝐱, (size(𝐱, 1), :))    
+    x = m.arch[1:5](x)
+    σ = reshape(relu.(x[1, :]), (1, size(𝐱, 2), size(𝐱, 3)) )
+    x = vcat(x[2:end, :], reshape(viewing_dir, (size(viewing_dir, 1), :) ))
+    x = m.arch[6:7](x)
+    rgb = reshape(x, (3, size(𝐱, 2), size(𝐱, 3)) )
+
+    return σ, rgb
 end
 
 """
@@ -92,45 +125,49 @@ function get_pts(origin, directions, near, far, n_samples; randomized=false)
     if randomized
         z_vals = rand(1, size(directions, 2), n_samples) .* ((far - near) / n_samples) .+ z_vals
     end
-    return origin .+ (directions .* z_vals), collect(z_vals)
+    pts = origin .+ (directions .* z_vals)
+
+    view_dirs = similar(pts)
+    view_dirs .= directions ./ sqrt.(sum(directions.^2, dims=1))
+
+    return pts, view_dirs, collect(z_vals)
 end
 
-function render(emb_fn, network_fn, pts, z_vals)
-    raw = network_fn(emb_fn(pts))
+function render(emb_fn, network_fn, pts, directions, z_vals)
+    σₐ, rgb = network_fn(emb_fn(pts), emb_fn(directions))
 
-    σₐ = relu.(raw[4:4, :, :])
-    rgb = sigmoid.(raw[1:3, :, :])
-
-    δ = cat(z_vals[:, :, 2:end] .- z_vals[:, :, 1:(end-1)], fill(eltype(z_vals)(1e10), size(z_vals)[[1, 2]]), dims=3)
+    δ = ignore() do 
+        cat(z_vals[:, :, 2:end] .- z_vals[:, :, 1:(end-1)], fill(eltype(z_vals)(1e10), size(z_vals)[[1, 2]]), dims=3)
+    end
     α = 1 .- exp.(-σₐ .* δ)
-    weights = α .* cat(gpu(ones(1, size(α, 2))), cumprod((1 .- α .+ eltype(α)(1e-10))[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
+    weights = α .* cat(gpu(ones(1, size(α, 2))), cumprod((1 .- α .+ eps(eltype(α)))[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
     
     rgb_map = sum(rgb .* weights, dims=3)[:, :, 1]
 end
 
-function train!(model, opt, images, poses; n_samples=64, batch_size=3000, n_iters=1000, i_plot=25)
+function train!(mlp, opt, images, poses; n_samples=64, batch_size=3000, n_iters=1000, i_plot=25)
     @assert batch_size <= H*W
 
     PSNRs, iternums = [], []
     
-    ps = params(model)
+    ps = params(mlp)
     local ℒ
     
     for i in 1:n_iters
-        img_index = rand(1:size(images, 3))
+        img_index = rand(1:size(images, 4))
         pose = poses[:, :, img_index]
 
-        weights = ProbabilityWeights(map((x)->gaussian_2d(x..., W/5, H/5), Tuple.(CartesianIndices((H, W))))[:])
+        weights = ProbabilityWeights(map((x)->gaussian_2d(x..., W/6, H/6), Tuple.(CartesianIndices((H, W))))[:])
 
         pixels = CartesianIndices((H, W))[sample(1:H*W, weights, batch_size, replace=false)]
 
         target = gpu(images[:, :, :, img_index][:, pixels])
 
         origin, directions = get_rays(pixels, H, W, focal, pose)
-        pts, z_vals = gpu(get_pts(origin, directions, 2, 5, n_samples, randomized=true))
+        pts, directions, z_vals = gpu(get_pts(origin, directions, 2, 5, n_samples, randomized=true))
         
         gs = gradient(ps) do
-            prediction = render(posenc, model, pts, z_vals)
+            prediction = render(posenc, mlp, pts, directions, z_vals)
             ℒ = mean((prediction .- target).^2)
             return ℒ
         end
@@ -140,11 +177,11 @@ function train!(model, opt, images, poses; n_samples=64, batch_size=3000, n_iter
         if i%i_plot == 0
             pixels = CartesianIndices((H, W))[:]
             origin, directions = get_rays(pixels, H, W, focal, testpose)
-            pts, z_vals = gpu(get_pts(origin, directions, 2, 5, n_samples))
+            pts, directions, z_vals = gpu(get_pts(origin, directions, 2, 5, min(16, n_samples), randomized=true))
 
-            prediction = render(posenc, model, pts, z_vals)
-            rgb = reshape(cpu(prediction), (3, H, W))
-            display(colorview(RGB, rgb))
+            prediction = hcat([render(posenc, mlp, pts[:, 10000*i+1:10000*(i+1), :], directions[:, 10000*i+1:10000*(i+1), :], z_vals[:, 10000*i+1:10000*(i+1), :]) for i in 0:63]...)
+            rgb = reshape(prediction, (3, H, W))
+            display(colorview(RGB, cpu(rgb)))
             
             testing_loss = mean((rgb .- testimg).^2)
             PSNR = -10 * log10(testing_loss)
@@ -156,7 +193,23 @@ function train!(model, opt, images, poses; n_samples=64, batch_size=3000, n_iter
     return PSNRs, iternums
 end
 
-opt = ADAM(5e-4)
-m = gpu(init_model())
+opt = ADAM(5e-3)
+mlp = MLP()|>gpu
 
-train!(m, opt, images, poses, n_samples=64, batch_size=500, n_iters=1000, i_plot=25)
+train!(mlp, opt, images, poses, n_samples=64, batch_size=2048, n_iters=1000, i_plot=100)
+
+
+pixels = CartesianIndices((H, W))[:]
+origin, directions = get_rays(pixels, H, W, focal, testpose)
+pts, directions, z_vals = gpu(get_pts(origin, directions, 2, 5, 128, randomized=true))
+
+prediction = hcat([render(posenc, mlp, pts[:, 5000*i+1:5000*(i+1), :], directions[:, 5000*i+1:5000*(i+1), :], z_vals[:, 5000*i+1:5000*(i+1), :]) for i in 0:64*2-1]...)
+rgb = reshape(prediction, (3, H, W))
+display(colorview(RGB, cpu(rgb)))
+
+testing_loss = mean((rgb .- testimg).^2)
+PSNR = -10 * log10(testing_loss)
+
+
+pts, directions, z_vals = 0, 0, 0
+prediction = 0
