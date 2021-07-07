@@ -101,9 +101,9 @@ function render(emb_fn, network_fn, pts, z_vals)
     σₐ = relu.(raw[4:4, :, :])
     rgb = sigmoid.(raw[1:3, :, :])
 
-    δ = cat(z_vals[:, :, 2:end] .- z_vals[:, :, 1:(end-1)], fill(1e10, size(z_vals)[[1, 2]]), dims=3)
+    δ = cat(z_vals[:, :, 2:end] .- z_vals[:, :, 1:(end-1)], fill(eltype(z_vals)(1e10), size(z_vals)[[1, 2]]), dims=3)
     α = 1 .- exp.(-σₐ .* δ)
-    weights = α .* cat(gpu(ones(1, size(α, 2))), cumprod((1 .- α .+ 1e-10)[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
+    weights = α .* cat(gpu(ones(1, size(α, 2))), cumprod((1 .- α .+ eltype(α)(1e-10))[:, :, 1:end-1], dims=3), dims=3) # exclusive cumprod
     
     rgb_map = sum(rgb .* weights, dims=3)[:, :, 1]
 end
